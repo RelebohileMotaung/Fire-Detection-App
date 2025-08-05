@@ -5,6 +5,7 @@ import asyncio
 import logging
 import io
 import json
+import hashlib
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, WebSocketDisconnect
@@ -12,6 +13,7 @@ from fastapi.websockets import WebSocketState
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import cv2
+import numpy as np
 import smtplib
 from email.message import EmailMessage
 from langchain_core.messages import HumanMessage
@@ -20,6 +22,7 @@ from typing import Optional, List
 from pydantic import BaseModel
 import uvicorn
 import aiofiles
+from cachetools import TTLCache
 
 # Configure logging
 log_format = "%(asctime)s - %(levelname)s - %(message)s"
@@ -75,6 +78,7 @@ class State:
         self.video_writer = None
         self.recording_start = None
         self.recording_dir = "recordings"
+        self.ai_cache = TTLCache(maxsize=1000, ttl=300)  # 5-min cache
         os.makedirs(self.recording_dir, exist_ok=True)
         
     def log_event(self, event_type: str, message: str):
@@ -241,30 +245,63 @@ async def analyze_with_gemini():
             "details": "The system will continue monitoring without AI."
         }
 
+def has_possible_smoke(frame):
+    """Run initial OpenCV smoke detection using color thresholding and contours."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    lower = np.array([0, 0, 200])  # Adjust thresholds for smoke detection
+    upper = np.array([180, 50, 255])
+    mask = cv2.inRange(hsv, lower, upper)
+    return cv2.countNonZero(mask) > 1000
+
 async def process_frame(frame):
     """Saves the latest frame at intervals and starts AI analysis."""
     current_time = time.time()
     
-    # Broadcast frame update via WebSocket
+    # Motion detection - skip if insufficient changes
+    prev_frame = getattr(state, 'prev_frame', None)
+    if prev_frame is not None:
+        frame_diff = cv2.absdiff(frame, prev_frame)
+        # Convert to grayscale for countNonZero
+        gray_diff = cv2.cvtColor(frame_diff, cv2.COLOR_BGR2GRAY)
+        if cv2.countNonZero(gray_diff) < 5000:  # Threshold
+            return {"status": "skipped", "reason": "insufficient changes"}
+    state.prev_frame = frame.copy()
+    
+    # Run initial OpenCV smoke detection
+    smoke_detected = has_possible_smoke(frame)
+    
+    # Broadcast frame update via WebSocket (original resolution)
     _, buffer = cv2.imencode('.jpg', frame)
     await manager.broadcast(json.dumps({
         "type": "frame_update",
         "data": base64.b64encode(buffer).decode('utf-8'),
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "smoke_detected": smoke_detected
     }))
     
-    # Handle AI analysis at intervals
-    if current_time - state.last_sent_time >= state.send_interval:
+    # Only proceed with AI analysis if smoke is detected or at regular intervals
+    if smoke_detected or (current_time - state.last_sent_time >= state.send_interval):
+        if smoke_detected:
+            state.log_event("smoke_detection", "OpenCV smoke detection triggered")
+        
         state.last_sent_time = current_time
-        cv2.imwrite(state.image_path, frame)
+        
+        # Reduce resolution for AI analysis (640x480 instead of 1020x500)
+        analysis_frame = cv2.resize(frame, (640, 480))
+        cv2.imwrite(state.image_path, analysis_frame)  # Save reduced resolution for AI
+        
         ai_result = await analyze_with_gemini()
+        
         # Send update via WebSocket
         await manager.broadcast(json.dumps({
             "type": "analysis_update",
             "data": ai_result,
+            "smoke_detected": smoke_detected,
             "timestamp": datetime.now().isoformat()
         }))
         return ai_result
+    
+    return {"status": "skipped", "reason": "no smoke detected by OpenCV"}
 
 async def video_processing(video_file: str):
     """Reads video frames and processes them."""
