@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+opencv-python
+ultralytics
+numpy
+pydantic
+python-multipart
+aiofiles
+cachetools
+prometheus-client
+starlette-prometheus
+langchain-core
+langchain-google-genai
+python-dotenv
+email-validator
