@@ -23,11 +23,15 @@ import smtplib
 from email.message import EmailMessage
 from langchain_core.messages import HumanMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from typing import Optional, List
+from typing import Optional, List, Dict
 from pydantic import BaseModel
 import uvicorn
 import aiofiles
 from cachetools import TTLCache
+import shutil
+from pathlib import Path
+import pandas as pd
+from sklearn.metrics import precision_score, recall_score, f1_score
 
 # Configure logging
 log_format = "%(asctime)s - %(levelname)s - %(message)s"
@@ -196,9 +200,32 @@ class State:
             "gemini_confirmations": 0,
             "false_positive_rate": 0.0
         }
+        self.benchmark_stats = {
+            'fp32': {'fps': 0, 'latency': 0},
+            'fp16': {'fps': 0, 'latency': 0},
+            'int8': {'fps': 0, 'latency': 0}
+        }
         self.yolo_model = QuantizedYOLO("best.pt", quantize_mode='fp16')
         self.class_names = self.yolo_model.original_model.model.names
         os.makedirs(self.recording_dir, exist_ok=True)
+        
+        # Model management and evaluation
+        self.test_dataset_path = "test_dataset"
+        self.model_versions = {
+            "current": "best.pt",
+            "candidate": None  # Path to candidate model
+        }
+        self.evaluation_metrics = {
+            "precision": 0,
+            "recall": 0,
+            "f1": 0
+        }
+        os.makedirs("model_versions", exist_ok=True)
+        os.makedirs("active_learning", exist_ok=True)
+        
+        # Active learning
+        self.active_learning_threshold = 0.4  # Confidence threshold for uncertain cases
+        self.active_learning_dir = "active_learning"
         
         # Prometheus metrics
         self.metrics = PrometheusMetrics()
