@@ -150,6 +150,25 @@ with st.sidebar:
     st.subheader("AI Settings")
     api_key = st.text_input("Google API Key", type="password", placeholder="your-gemini-api-key")
     
+    # Model Optimization
+    st.subheader("Model Optimization")
+    quant_mode = st.selectbox(
+        "Quantization Mode",
+        ["none", "fp16", "int8"],
+        index=0,
+        help="FP16 for GPU acceleration, INT8 for CPU optimization"
+    )
+    
+    if st.button("Apply Quantization"):
+        response = requests.post(
+            f"{BACKEND_URL}/configure/quantization",
+            data={"mode": quant_mode}
+        )
+        if response.status_code == 200:
+            st.success(f"✅ Quantization mode set to {quant_mode}")
+        else:
+            st.error(f"❌ Failed to set quantization: {response.text}")
+    
     if st.button("Save Configuration"):
         if email_sender and email_password and email_receiver:
             email_config = {
@@ -162,6 +181,9 @@ with st.sidebar:
         if api_key:
             ai_config = {"google_api_key": api_key}
             requests.post(f"{BACKEND_URL}/configure/ai", json=ai_config)
+        
+        if quant_mode:
+            requests.post(f"{BACKEND_URL}/configure/quantization", data={"mode": quant_mode})
         
         st.success("✅ Configuration saved!")
 

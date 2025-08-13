@@ -16,7 +16,9 @@ from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from starlette_prometheus import metrics, PrometheusMiddleware
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
+from torch.quantization import quantize_dynamic
 import smtplib
 from email.message import EmailMessage
 from langchain_core.messages import HumanMessage
@@ -138,6 +140,33 @@ class AIConfig(BaseModel):
     google_api_key: str
 
 # Global state
+class QuantizedYOLO:
+    def __init__(self, model_path, quantize_mode='fp16'):
+        self.original_model = YOLO(model_path)
+        self.quantize_mode = quantize_mode
+        self.model = self._prepare_quantized_model()
+        
+    def _prepare_quantized_model(self):
+        model = self.original_model.model
+        model.eval()
+        
+        if self.quantize_mode == 'fp16':
+            model = model.half()
+        elif self.quantize_mode == 'int8':
+            model = quantize_dynamic(
+                model,
+                {torch.nn.Linear, torch.nn.Conv2d},
+                dtype=torch.qint8
+            )
+        return model
+        
+    def __call__(self, *args, **kwargs):
+        # Convert input to right dtype
+        if self.quantize_mode == 'fp16':
+            kwargs['imgsz'] = kwargs.get('imgsz', 640)
+            kwargs['half'] = True
+        return self.original_model(*args, **kwargs)
+
 class State:
     def __init__(self):
         self.running = False
@@ -167,8 +196,8 @@ class State:
             "gemini_confirmations": 0,
             "false_positive_rate": 0.0
         }
-        self.yolo_model = YOLO("best.pt")
-        self.class_names = self.yolo_model.model.names
+        self.yolo_model = QuantizedYOLO("best.pt", quantize_mode='fp16')
+        self.class_names = self.yolo_model.original_model.model.names
         os.makedirs(self.recording_dir, exist_ok=True)
         
         # Prometheus metrics
@@ -661,6 +690,36 @@ async def configure_threshold(threshold: float = Form(...)):
         return {"message": f"Detection threshold updated to {threshold}"}
     else:
         raise HTTPException(status_code=400, detail="Threshold must be between 0.1 and 0.9")
+
+@app.post("/configure/quantization")
+async def configure_quantization(mode: str = Form(...)):
+    """Configure model quantization mode (none, fp16, int8)"""
+    valid_modes = ['none', 'fp16', 'int8']
+    if mode not in valid_modes:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid mode. Must be one of {valid_modes}"
+        )
+    
+    if mode == 'none':
+        state.yolo_model = YOLO("best.pt")
+    else:
+        state.yolo_model = QuantizedYOLO("best.pt", quantize_mode=mode)
+    
+    state.class_names = state.yolo_model.original_model.model.names
+    return {"message": f"Quantization mode set to {mode}"}
+
+@app.get("/status")
+async def get_status():
+    return {
+        "running": state.running,
+        "alert_sent": state.alert_sent,
+        "last_alert": state.last_alert,
+        "frame_available": state.frame is not None,
+        "verification_stats": state.verification_stats,
+        "detection_threshold": state.detection_threshold,
+        "quantization_mode": getattr(state.yolo_model, 'quantize_mode', 'none')
+    }
 
 import signal
 import sys
