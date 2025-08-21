@@ -32,6 +32,12 @@ import shutil
 from pathlib import Path
 import pandas as pd
 from sklearn.metrics import precision_score, recall_score, f1_score
+import filetype
+
+# Configuration constants
+MAX_FILE_SIZE_MB = 100  # Maximum file size in MB
+ALLOWED_VIDEO_TYPES = {'mp4', 'avi', 'mov', 'mkv', 'flv', 'wmv', 'webm', 'm4v'}
+UPLOAD_DIR = 'uploads'
 
 # Configure logging
 log_format = "%(asctime)s - %(levelname)s - %(message)s"
@@ -628,9 +634,25 @@ async def start_monitoring(
     elif video_source == "webcam":
         video_file = 0
     elif video_source == "custom" and file:
-        video_file = file.filename
-        async with aiofiles.open(video_file, "wb") as f:
-            await f.write(await file.read())
+        # Validate file size
+        file.file.seek(0, 2)  # Seek to end
+        file_size = file.file.tell()
+        file.file.seek(0)  # Reset pointer
+        
+        if file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+            raise HTTPException(413, f"File too large. Max {MAX_FILE_SIZE_MB}MB allowed")
+        
+        # Validate file type
+        content = await file.read()
+        file_type = filetype.guess_extension(content)
+        if file_type not in ALLOWED_VIDEO_TYPES:
+            raise HTTPException(415, f"Invalid file type. Allowed: {ALLOWED_VIDEO_TYPES}")
+        
+        # Save to uploads dir
+        upload_path = os.path.join(UPLOAD_DIR, file.filename)
+        async with aiofiles.open(upload_path, "wb") as f:
+            await f.write(content)
+        video_file = upload_path
     else:
         raise HTTPException(status_code=400, detail="Invalid video source or missing file")
     
@@ -748,6 +770,16 @@ async def get_status():
         "quantization_mode": getattr(state.yolo_model, 'quantize_mode', 'none')
     }
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Docker HEALTHCHECK"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "service": "fire-detection-api",
+        "version": "1.0.0"
+    }
+
 import signal
 import sys
 
@@ -756,7 +788,8 @@ shutdown_event = asyncio.Event()
 @app.on_event("startup")
 async def startup_event():
     # Initialize resources if needed
-    pass
+    # Ensure upload directory exists
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 @app.on_event("shutdown")
 async def shutdown_event_handler():
