@@ -5,6 +5,7 @@ from torch.quantization import quantize_dynamic
 class QuantizedYOLO:
     def __init__(self, model_path, quantize_mode='fp16'):
         self.original_model = YOLO(model_path)
+        self.names = self.original_model.names
         self.quantize_mode = quantize_mode
         self.model = self._prepare_quantized_model()
         

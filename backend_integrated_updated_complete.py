@@ -14,10 +14,16 @@ from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from starlette_prometheus import metrics, PrometheusMiddleware
+from utils.semantic_cache import SemanticFrameCache
 import cv2
 import numpy as np
+
+frame_cache = SemanticFrameCache()
 import torch
 from ultralytics import YOLO
+import asyncio
+from utils.async_cv2 import run_in_cv2_thread, async_detect_fire_yolo
+from quantized_yolo import QuantizedYOLO
 from torch.quantization import quantize_dynamic
 import smtplib
 from email.message import EmailMessage
@@ -56,28 +62,27 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # STARTUP: Preload resources before accepting traffic
-    logger.info("🚀 Initializing Fire/Smoke Detection System...")
+    logger.info("[START] Initializing Fire/Smoke Detection System...")
     os.makedirs(UPLOAD_DIR, exist_ok=True)
-    os.makedirs(state.recording_dir, exist_ok=True)
     
     # Preload YOLO model
     try:
         state.yolo_model = QuantizedYOLO("best.pt", quantize_mode='fp16')
-        state.class_names = state.yolo_model.original_model.model.names
-        logger.info("✅ YOLO model loaded successfully")
+        state.class_names = state.yolo_model.names
+        logger.info("[OK] YOLO model loaded successfully")
     except Exception as e:
-        logger.error(f"❌ Failed to load YOLO model: {e}")
+        logger.error(f"[ERROR] Failed to load YOLO model: {e}")
         raise
         
     yield  # Server runs here
     
     # SHUTDOWN: Graceful cleanup
-    logger.info("🛑 Shutting down system...")
+    logger.info("[STOP] Shutting down system...")
     state.running = False
     state.stop_recording()
     if state.gemini_model:
         del state.gemini_model
-    logger.info("✅ Cleanup complete")
+    logger.info("[OK] Cleanup complete")
 
 app = FastAPI(title="Fire/Smoke Detection System API", lifespan=lifespan)
 
@@ -178,33 +183,6 @@ class AIConfig(BaseModel):
     google_api_key: str
 
 # Global state
-class QuantizedYOLO:
-    def __init__(self, model_path, quantize_mode='fp16'):
-        self.original_model = YOLO(model_path)
-        self.quantize_mode = quantize_mode
-        self.model = self._prepare_quantized_model()
-        
-    def _prepare_quantized_model(self):
-        model = self.original_model.model
-        model.eval()
-        
-        if self.quantize_mode == 'fp16':
-            model = model.half()
-        elif self.quantize_mode == 'int8':
-            model = quantize_dynamic(
-                model,
-                {torch.nn.Linear, torch.nn.Conv2d},
-                dtype=torch.qint8
-            )
-        return model
-        
-    def __call__(self, *args, **kwargs):
-        # Convert input to right dtype
-        if self.quantize_mode == 'fp16':
-            kwargs['imgsz'] = kwargs.get('imgsz', 640)
-            kwargs['half'] = True
-        return self.original_model(*args, **kwargs)
-
 class State:
     def __init__(self):
         self.running = False
@@ -399,35 +377,7 @@ async def analyze_with_gemini(image_path: str):
         ).inc()
         return {"status": "error", "message": f"AI analysis failed: {str(e)}"}
 
-async def detect_fire_yolo(frame):
-    """Run YOLO fire detection on the frame."""
-    try:
-        results = state.yolo_model(frame, conf=state.detection_threshold)
-        fire_detected = False
-        detections = []
-        
-        for r in results:
-            boxes = r.boxes
-            if boxes is not None:
-                for box in boxes:
-                    x1, y1, x2, y2 = box.xyxy[0]
-                    conf = box.conf[0]
-                    cls = int(box.cls[0])
-                    class_name = state.class_names[cls]
-                    
-                    if class_name.lower() in ['fire', 'smoke']:
-                        fire_detected = True
-                        detections.append({
-                            'bbox': [int(x1), int(y1), int(x2), int(y2)],
-                            'confidence': float(conf),
-                            'class': class_name
-                        })
-        
-        return fire_detected, detections
-    except Exception as e:
-        state.metrics.frame_processing_errors.labels(error_type='yolo_detection').inc()
-        logger.error(f"YOLO detection error: {e}")
-        return False, []
+
 
 async def process_frame(frame):
     """Process a single frame for fire detection."""
@@ -438,7 +388,9 @@ async def process_frame(frame):
     state.metrics.system_status.labels(component='processing').set(1)
     
     # Run YOLO detection
-    fire_detected, detections = await detect_fire_yolo(frame)
+    fire_detected, detections = await async_detect_fire_yolo(
+        state.yolo_model, frame, state.detection_threshold, ['fire', 'smoke']
+    )
     
     # Update detection counter
     if fire_detected:
@@ -448,16 +400,16 @@ async def process_frame(frame):
     annotated_frame = frame.copy()
     for detection in detections:
         x1, y1, x2, y2 = detection['bbox']
-        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        await run_in_cv2_thread(cv2.rectangle, annotated_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
         label = f"{detection['class']} {detection['confidence']:.2f}"
-        cv2.putText(annotated_frame, label, (x1, y1-10), 
+        await run_in_cv2_thread(cv2.putText, annotated_frame, label, (x1, y1-10), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
     
     # Save frame for AI analysis
-    cv2.imwrite(state.image_path, frame)
+    await run_in_cv2_thread(cv2.imwrite, state.image_path, frame)
     
     # Broadcast frame via WebSocket
-    _, buffer = cv2.imencode('.jpg', annotated_frame)
+    _, buffer = await run_in_cv2_thread(cv2.imencode, '.jpg', annotated_frame)
     await manager.broadcast(json.dumps({
         "type": "frame_update",
         "data": base64.b64encode(buffer).decode('utf-8'),
@@ -468,6 +420,17 @@ async def process_frame(frame):
     # Handle fire detection
     if fire_detected:
         state.verification_stats["yolo_detections"] += 1
+        
+        # Check cache first
+        cached_result = frame_cache.get(state.frame, state.metrics)
+        if cached_result:
+            await manager.broadcast(json.dumps({
+                "type": "alert",
+                "message": cached_result["message"],
+                "timestamp": datetime.now().isoformat(),
+                "cached": True  # For debugging
+            }))
+            return {"status": "alert", "detections": detections, "ai_result": cached_result, "cached": True}
         
         # Check cooldown
         if current_time - state.last_sent_time >= state.send_interval:
@@ -491,6 +454,10 @@ async def process_frame(frame):
                 state.verification_stats["false_positive_rate"] = (
                     (total - confirmed) / total * 100 if total > 0 else 0
                 )
+                
+                # Cache the result for future similar frames
+                if ai_result.get("status") in ["success", "info"]:
+                    frame_cache.set(state.frame, ai_result)
                 
                 # Send email alert
                 email_result = await send_email_alert(
@@ -581,32 +548,6 @@ State.start_recording = start_recording
 State.add_frame = add_frame
 State.stop_recording = stop_recording
 
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # STARTUP: Preload resources before accepting traffic
-    logger.info("🚀 Initializing Fire/Smoke Detection System...")
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    os.makedirs(state.recording_dir, exist_ok=True)
-    
-    # Preload YOLO model
-    try:
-        state.yolo_model = QuantizedYOLO("best.pt", quantize_mode='fp16')
-        state.class_names = state.yolo_model.original_model.model.names
-        logger.info("✅ YOLO model loaded successfully")
-    except Exception as e:
-        logger.error(f"❌ Failed to load YOLO model: {e}")
-        raise
-        
-    yield  # Server runs here
-    
-    # SHUTDOWN: Graceful cleanup
-    logger.info("🛑 Shutting down system...")
-    state.running = False
-    state.stop_recording()
-    if state.gemini_model:
-        del state.gemini_model
-    logger.info("✅ Cleanup complete")
-
 async def video_processing(video_source):
     """Main video processing loop."""
     try:
@@ -623,7 +564,7 @@ async def video_processing(video_source):
                 state.metrics.frame_processing_errors.labels(error_type='frame_read').inc()
                 break
             
-            frame = cv2.resize(frame, (1020, 500))
+            frame = await run_in_cv2_thread(cv2.resize, frame, (1020, 500))
             state.frame = frame.copy()
             
             await process_frame(frame)
@@ -723,7 +664,7 @@ async def get_latest_frame():
     if state.frame is None:
         raise HTTPException(status_code=404, detail="No frame available")
     
-    _, buffer = cv2.imencode('.jpg', state.frame)
+    _, buffer = await run_in_cv2_thread(cv2.imencode, '.jpg', state.frame)
     return StreamingResponse(io.BytesIO(buffer.tobytes()), media_type="image/jpeg")
 
 @app.post("/test_email")
@@ -798,7 +739,7 @@ async def configure_quantization(mode: str = Form(...)):
     else:
         state.yolo_model = QuantizedYOLO("best.pt", quantize_mode=mode)
     
-    state.class_names = state.yolo_model.original_model.model.names
+    state.class_names = state.yolo_model.names
     return {"message": f"Quantization mode set to {mode}"}
 
 @app.get("/status")
