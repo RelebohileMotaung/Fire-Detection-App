@@ -23,7 +23,7 @@ import smtplib
 from email.message import EmailMessage
 from langchain_core.messages import HumanMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, AsyncIterator
 from pydantic import BaseModel
 import uvicorn
 import aiofiles
@@ -51,7 +51,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Fire/Smoke Detection System API")
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # STARTUP: Preload resources before accepting traffic
+    logger.info("🚀 Initializing Fire/Smoke Detection System...")
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    os.makedirs(state.recording_dir, exist_ok=True)
+    
+    # Preload YOLO model
+    try:
+        state.yolo_model = QuantizedYOLO("best.pt", quantize_mode='fp16')
+        state.class_names = state.yolo_model.original_model.model.names
+        logger.info("✅ YOLO model loaded successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to load YOLO model: {e}")
+        raise
+        
+    yield  # Server runs here
+    
+    # SHUTDOWN: Graceful cleanup
+    logger.info("🛑 Shutting down system...")
+    state.running = False
+    state.stop_recording()
+    if state.gemini_model:
+        del state.gemini_model
+    logger.info("✅ Cleanup complete")
+
+app = FastAPI(title="Fire/Smoke Detection System API", lifespan=lifespan)
 
 # CORS configuration
 app.add_middleware(
@@ -211,8 +239,6 @@ class State:
             'fp16': {'fps': 0, 'latency': 0},
             'int8': {'fps': 0, 'latency': 0}
         }
-        self.yolo_model = QuantizedYOLO("best.pt", quantize_mode='fp16')
-        self.class_names = self.yolo_model.original_model.model.names
         os.makedirs(self.recording_dir, exist_ok=True)
         
         # Model management and evaluation
@@ -555,6 +581,32 @@ State.start_recording = start_recording
 State.add_frame = add_frame
 State.stop_recording = stop_recording
 
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # STARTUP: Preload resources before accepting traffic
+    logger.info("🚀 Initializing Fire/Smoke Detection System...")
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    os.makedirs(state.recording_dir, exist_ok=True)
+    
+    # Preload YOLO model
+    try:
+        state.yolo_model = QuantizedYOLO("best.pt", quantize_mode='fp16')
+        state.class_names = state.yolo_model.original_model.model.names
+        logger.info("✅ YOLO model loaded successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to load YOLO model: {e}")
+        raise
+        
+    yield  # Server runs here
+    
+    # SHUTDOWN: Graceful cleanup
+    logger.info("🛑 Shutting down system...")
+    state.running = False
+    state.stop_recording()
+    if state.gemini_model:
+        del state.gemini_model
+    logger.info("✅ Cleanup complete")
+
 async def video_processing(video_source):
     """Main video processing loop."""
     try:
@@ -664,16 +716,7 @@ async def stop_monitoring():
     state.running = False
     return {"message": "Monitoring stopped successfully"}
 
-@app.get("/status")
-async def get_status():
-    return {
-        "running": state.running,
-        "alert_sent": state.alert_sent,
-        "last_alert": state.last_alert,
-        "frame_available": state.frame is not None,
-        "verification_stats": state.verification_stats,
-        "detection_threshold": state.detection_threshold
-    }
+
 
 @app.get("/frame")
 async def get_latest_frame():
@@ -782,25 +825,12 @@ async def health_check():
 
 import signal
 import sys
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
 
 shutdown_event = asyncio.Event()
 
-@app.on_event("startup")
-async def startup_event():
-    # Initialize resources if needed
-    # Ensure upload directory exists
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-@app.on_event("shutdown")
-async def shutdown_event_handler():
-    # Properly close async resources here
-    # Wait for gRPC async cleanup if applicable
-    try:
-        # If you have any grpc aio channels or servers, close them here
-        # Example: await grpc_server.stop(0)
-        pass
-    except Exception as e:
-        logger.error(f"Error during shutdown: {e}")
 
 def handle_exit(sig, frame):
     logger.info(f"Received exit signal {sig.name}, shutting down...")
