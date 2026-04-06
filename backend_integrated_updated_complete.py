@@ -15,6 +15,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from starlette_prometheus import metrics, PrometheusMiddleware
 from utils.semantic_cache import SemanticFrameCache
+from app.core.settings import settings
+from app.database.database import DatabaseManager
+from app.database.models import Base, Detection, Incident, ModelVersion
+from sqlalchemy.future import select
+from sqlalchemy import and_, update
 import cv2
 import numpy as np
 
@@ -70,6 +75,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         state.yolo_model = QuantizedYOLO("best.pt", quantize_mode='fp16')
         state.class_names = state.yolo_model.names
         logger.info("[OK] YOLO model loaded successfully")
+        
+        # Initialize database
+        await db_manager.create_tables()
+        logger.info("[OK] Database tables created")
     except Exception as e:
         logger.error(f"[ERROR] Failed to load YOLO model: {e}")
         raise
@@ -236,10 +245,58 @@ class State:
         # Active learning
         self.active_learning_threshold = 0.4  # Confidence threshold for uncertain cases
         self.active_learning_dir = "active_learning"
+        self.current_detections = []
+        self.current_incident_id = None
+        self.current_recording_path = None
         
         # Prometheus metrics
         self.metrics = PrometheusMetrics()
+
+    
+    async def add_frame(self, frame):
+        if self.recording and self.video_writer is not None:
+            self.video_writer.write(frame)
+
+    async def stop_recording(self):
+        if not self.recording or self.video_writer is None or not self.current_incident_id:
+            return
         
+        duration = time.time() - self.recording_start
+        self.video_writer.release()
+        self.video_writer = None
+        self.recording = False
+        self.recording_start = None
+        
+        # Calculate incident metrics from detections
+        async with db_manager.get_session() as session:
+            incident = await session.get(Incident, self.current_incident_id)
+            if incident:
+                # Get all detections for this incident
+                detections = await session.execute(
+                    select(Detection).where(Detection.incident_id == self.current_incident_id)
+                )
+                detections_list = detections.scalars().all()
+                
+                if detections_list:
+                    confidences = [d.confidence for d in detections_list if d.confidence]
+                    incident.detection_id = detections_list[0].id  # First detection
+                    incident.duration_seconds = duration
+                    incident.max_confidence = max(confidences) if confidences else 0.0
+                    incident.avg_confidence = sum(confidences)/len(confidences) if confidences else 0.0
+                    incident.total_detections = len(detections_list)
+                    incident.recording_path = self.current_recording_path
+                    incident.end_time = datetime.now()
+                    incident.status = "resolved"  # Default, can be updated via API
+                    
+                    session.add(incident)
+                    await session.commit()
+                    self.log_event("incident", f"Completed incident {self.current_incident_id}: {len(detections_list)} detections, avg conf {incident.avg_confidence:.2f}")
+        
+        self.metrics.recording_status.set(0)
+        self.metrics.recording_duration.observe(duration)
+        self.current_incident_id = None
+        self.current_detections.clear()
+    
     def log_event(self, event_type: str, message: str):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_entry = f"[{timestamp}] {event_type.upper()}: {message}\n"
@@ -281,6 +338,8 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 state = State()
+
+db_manager = DatabaseManager(settings.database_url)
 
 # Email and AI functions
 async def send_email_alert(subject: str, body: str, image_path: str = None):
@@ -392,6 +451,25 @@ async def process_frame(frame):
         state.yolo_model, frame, state.detection_threshold, ['fire', 'smoke']
     )
     
+    # Save detections to database
+    if detections:
+        async with db_manager.get_session() as session:
+            for det in detections:
+                detection = Detection(
+                    camera_id="default",
+                    confidence=det['confidence'],
+                    detection_type=det['class'],
+                    bbox=det['bbox'],
+                    image_path=state.image_path,
+                    recording_path=getattr(state, 'current_recording_path', None),
+                    incident_id=state.current_incident_id
+                )
+                session.add(detection)
+                state.current_detections.append(detection.id)  # Append before flush for ID if needed
+            await session.flush()  # Get IDs without commit
+            await session.commit()
+
+    
     # Update detection counter
     if fire_detected:
         state.metrics.detection_counter.labels(type='yolo', source='yolo').inc()
@@ -447,6 +525,17 @@ async def process_frame(frame):
                     type='ai_verification'
                 ).inc()
                 state.verification_stats["gemini_confirmations"] += 1
+                
+                # Update latest detection with AI verification
+                if state.current_detections:
+                    last_det_id = state.current_detections.pop()
+                    async with db_manager.get_session() as session:
+                        det = await session.get(Detection, last_det_id)
+                        if det:
+                            det.ai_verified = True
+                            det.ai_response = ai_result["message"]
+                            session.add(det)
+                            await session.commit()
                 
                 # Calculate false positive rate
                 total = state.verification_stats["yolo_detections"]
@@ -512,41 +601,9 @@ async def process_frame(frame):
     
     return {"status": "clear", "detections": detections}
 
-# Add recording methods to State class
-def start_recording(self, frame):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{self.recording_dir}/incident_{timestamp}.avi"
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    self.video_writer = cv2.VideoWriter(
-        filename,
-        fourcc,
-        20.0,
-        (frame.shape[1], frame.shape[0])
-    )
-    self.recording = True
-    self.recording_start = time.time()
-    self.metrics.recording_status.set(1)
-    self.log_event("recording", f"Started recording: {filename}")
 
-def add_frame(self, frame):
-    if self.recording and self.video_writer is not None:
-        self.video_writer.write(frame)
 
-def stop_recording(self):
-    if self.recording and self.video_writer is not None:
-        duration = time.time() - self.recording_start
-        self.video_writer.release()
-        self.video_writer = None
-        self.recording = False
-        self.metrics.recording_status.set(0)
-        self.metrics.recording_duration.observe(duration)
-        self.log_event("recording", 
-                      f"Stopped recording (duration: {duration:.2f}s)")
 
-# Add methods to State class
-State.start_recording = start_recording
-State.add_frame = add_frame
-State.stop_recording = stop_recording
 
 async def video_processing(video_source):
     """Main video processing loop."""
@@ -687,25 +744,105 @@ async def test_email(config: EmailConfig):
         state.log_event("error", f"Email test failed: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Failed to send test email: {str(e)}")
 
+@app.get("/incidents")
+async def list_incidents(status: Optional[str] = None, limit: int = 50):
+    """List incidents from DB with optional status filter."""
+    async with db_manager.get_session() as session:
+        query = select(Incident).order_by(Incident.start_time.desc()).limit(limit)
+        if status:
+            query = query.where(Incident.status == status)
+        result = await session.execute(query)
+        incidents = result.scalars().all()
+        return {
+            "incidents": [
+                {
+                    "id": i.id,
+                    "start_time": i.start_time.isoformat() if i.start_time else None,
+                    "end_time": i.end_time.isoformat() if i.end_time else None,
+                    "duration_seconds": getattr(i, 'duration_seconds', 0),
+                    "max_confidence": getattr(i, 'max_confidence', 0),
+                    "avg_confidence": getattr(i, 'avg_confidence', 0),
+                    "total_detections": getattr(i, 'total_detections', 0),
+                    "recording_path": i.recording_path,
+                    "status": i.status,
+                    "resolution_notes": i.resolution_notes
+                } for i in incidents
+            ]
+        }
+
+@app.get("/detections")
+async def list_detections(incident_id: Optional[int] = None, limit: int = 100):
+    """List recent detections."""
+    async with db_manager.get_session() as session:
+        query = select(Detection).order_by(Detection.timestamp.desc()).limit(limit)
+        if incident_id:
+            query = query.where(Detection.incident_id == incident_id)
+        result = await session.execute(query)
+        detections = result.scalars().all()
+        return {
+            "detections": [
+                {
+                    "id": d.id,
+                    "incident_id": d.incident_id,
+                    "timestamp": d.timestamp.isoformat() if d.timestamp else None,
+                    "confidence": d.confidence,
+                    "detection_type": d.detection_type,
+                    "bbox": d.bbox,
+                    "ai_verified": d.ai_verified,
+                    "false_positive": d.false_positive
+                } for d in detections
+            ]
+        }
+
+@app.get("/model_versions")
+async def list_model_versions(active_only: bool = True):
+    """List model versions."""
+    async with db_manager.get_session() as session:
+        query = select(ModelVersion).order_by(ModelVersion.created_at.desc())
+        if active_only:
+            query = query.where(ModelVersion.is_active == True)
+        result = await session.execute(query)
+        versions = result.scalars().all()
+        return {
+            "model_versions": [
+                {
+                    "id": m.id,
+                    "version": m.version,
+                    "model_path": m.model_path,
+                    "quantization_mode": m.quantization_mode,
+                    "is_active": m.is_active,
+                    "metrics": m.metrics
+                } for m in versions
+            ]
+        }
+
+@app.post("/incidents/{incident_id}/resolve")
+async def resolve_incident(incident_id: int, is_false_positive: bool = Form(False), notes: str = Form("")):
+    """Mark incident as resolved/false alarm, label detections."""
+    async with db_manager.get_session() as session:
+        incident = await session.get(Incident, incident_id)
+        if not incident:
+            raise HTTPException(404, "Incident not found")
+        
+        incident.status = "false_alarm" if is_false_positive else "resolved"
+        incident.resolution_notes = notes
+        
+        # Label all detections as false positive
+        if is_false_positive:
+            await session.execute(
+                update(Detection)
+                .where(Detection.incident_id == incident_id)
+                .values(false_positive=True)
+            )
+        
+        await session.commit()
+        return {"message": f"Incident {incident_id} marked as {'false_alarm' if is_false_positive else 'resolved'}"}
+
+
 @app.get("/recordings")
 async def list_recordings():
-    """List all recorded incident videos."""
-    recordings = []
-    try:
-        for filename in os.listdir(state.recording_dir):
-            if filename.endswith(".avi"):
-                filepath = os.path.join(state.recording_dir, filename)
-                timestamp = datetime.fromtimestamp(
-                    os.path.getctime(filepath)
-                ).strftime("%Y-%m-%d %H:%M:%S")
-                recordings.append({
-                    "filename": filename,
-                    "timestamp": timestamp,
-                    "url": f"/recordings/{filename}"
-                })
-    except Exception as e:
-        logger.error(f"Failed to list recordings: {str(e)}")
-    return {"files": recordings}
+    """Backward compat: List recordings, enhanced with incident data."""
+    return await list_incidents()
 
 @app.get("/recordings/{filename}")
 async def get_recording(filename: str):
@@ -734,13 +871,30 @@ async def configure_quantization(mode: str = Form(...)):
             detail=f"Invalid mode. Must be one of {valid_modes}"
         )
     
+    old_mode = getattr(state.yolo_model, 'quantize_mode', 'none') if state.yolo_model else 'none'
+    
     if mode == 'none':
         state.yolo_model = YOLO("best.pt")
     else:
         state.yolo_model = QuantizedYOLO("best.pt", quantize_mode=mode)
     
     state.class_names = state.yolo_model.names
-    return {"message": f"Quantization mode set to {mode}"}
+    
+    # Log model version
+    async with db_manager.get_session() as session:
+        version = ModelVersion(
+            version=f"best.pt-{mode}",
+            model_path="best.pt",
+            quantization_mode=mode,
+            is_active=True,
+            metrics={"old_mode": old_mode}
+        )
+        # Deactivate previous
+        await session.execute(update(ModelVersion).where(ModelVersion.is_active == True).values(is_active=False))
+        session.add(version)
+        await session.commit()
+    
+    return {"message": f"Quantization mode set to {mode}, ModelVersion logged"}
 
 @app.get("/status")
 async def get_status():
