@@ -263,8 +263,21 @@ with col2:
     
     if recordings.get("files"):
         for recording in recordings["files"]:
-            st.video(f"{BACKEND_URL}/recordings/{recording['filename']}")
-            st.caption(f"Recorded at {recording['timestamp']}")
+            video_url = f"{BACKEND_URL}/recordings/{recording['filename']}"
+            st.markdown(
+                f'''
+                <div style="margin-bottom: 1em;">
+                    <video width="100%" height="300" controls preload="metadata">
+                        <source src="{video_url}" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                    <p style="margin-top: 0.5em; font-size: 0.9em; color: #666;">
+                        Recorded at {recording['timestamp']}
+                    </p>
+                </div>
+                ''',
+                unsafe_allow_html=True
+            )
     else:
         st.info("No incidents recorded yet")
 

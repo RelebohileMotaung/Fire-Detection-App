@@ -332,7 +332,7 @@ async def analyze_with_gemini(image_path: str):
             content=[
                 {
                     "type": "text",
-                    "text": "Analyze this image for fire or smoke. If detected, provide a clear alert message including what you see. If no fire/smoke, respond with 'No fire detected'."
+                    "text": """Analyze the image and determine if fire or smoke is present. If fire or smoke is detected, generate a complete email automatically. - Write a **clear and urgent subject** (avoid long text). - Write a **professional but urgent email body**. - **Include emergency contact numbers** for Fire Department and Ambulance (local numbers for Free State). - If no fire or smoke is detected, simply respond with 'No fire detected'."""
                 },
                 {
                     "type": "image_url",
